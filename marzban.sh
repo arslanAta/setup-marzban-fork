@@ -1483,6 +1483,132 @@ update_marzban() {
     $COMPOSE -f $COMPOSE_FILE -p "$APP_NAME" pull
 }
 
+import_command() {
+    # marzban cli import <path-to-sqlite3>
+    # Validates a SQLite Marzban DB, installs it at /var/lib/marzban/db.sqlite3,
+    # and restarts the container so alembic upgrades to head.
+    check_running_as_root
+
+    local src_path="$1"
+    if [ -z "$src_path" ]; then
+        colorized_echo red "Usage: marzban cli import <path-to-sqlite3-file>"
+        exit 1
+    fi
+    if [ ! -f "$src_path" ]; then
+        colorized_echo red "File not found: $src_path"
+        exit 1
+    fi
+
+    if ! is_marzban_installed; then
+        colorized_echo red "Marzban is not installed. Run 'marzban install' first."
+        exit 1
+    fi
+    detect_compose
+
+    # Refuse on non-SQLite deployments to avoid silently overwriting nothing
+    # while the panel keeps reading from MySQL/MariaDB.
+    if grep -qE "^\s*image:\s*(mariadb|mysql)" "$COMPOSE_FILE"; then
+        colorized_echo red "This deployment uses MySQL/MariaDB. 'cli import' only supports SQLite installs."
+        exit 1
+    fi
+    if grep -q "SQLALCHEMY_DATABASE_URL = .*mysql" "$ENV_FILE" 2>/dev/null; then
+        colorized_echo red "SQLALCHEMY_DATABASE_URL in .env points to MySQL. 'cli import' only supports SQLite."
+        exit 1
+    fi
+
+    # sqlite3 binary is required on the host for pre-flight checks
+    if ! command -v sqlite3 >/dev/null 2>&1; then
+        detect_os
+        install_package sqlite3
+    fi
+
+    # 1. Integrity check
+    colorized_echo blue "Checking integrity of $src_path"
+    local check
+    check=$(sqlite3 "$src_path" "PRAGMA integrity_check;" 2>&1 | head -1)
+    if [ "$check" != "ok" ]; then
+        colorized_echo red "Integrity check failed: $check"
+        colorized_echo yellow "Try recovering the file first, then re-run:"
+        echo "  sqlite3 '$src_path' '.recover' | sqlite3 /tmp/fixed.sqlite3"
+        echo "  marzban cli import /tmp/fixed.sqlite3"
+        exit 1
+    fi
+    colorized_echo green "Integrity: ok"
+
+    # 2. Alembic revision sanity
+    local src_rev
+    src_rev=$(sqlite3 "$src_path" "SELECT version_num FROM alembic_version;" 2>/dev/null)
+    if [ -z "$src_rev" ]; then
+        colorized_echo red "No 'alembic_version' table found — this does not look like a Marzban database."
+        exit 1
+    fi
+    colorized_echo cyan "Source DB alembic revision: $src_rev"
+
+    # Show row counts for confidence
+    local users_n admins_n
+    users_n=$(sqlite3 "$src_path" "SELECT COUNT(*) FROM users;" 2>/dev/null || echo "?")
+    admins_n=$(sqlite3 "$src_path" "SELECT COUNT(*) FROM admins;" 2>/dev/null || echo "?")
+    colorized_echo cyan "Source DB contents: users=$users_n  admins=$admins_n"
+
+    # 3. Confirm overwrite
+    local target="/var/lib/marzban/db.sqlite3"
+    if [ -f "$target" ]; then
+        local cur_rev cur_users
+        cur_rev=$(sqlite3 "$target" "SELECT version_num FROM alembic_version;" 2>/dev/null || echo "?")
+        cur_users=$(sqlite3 "$target" "SELECT COUNT(*) FROM users;" 2>/dev/null || echo "?")
+        colorized_echo yellow "An existing DB at $target will be replaced."
+        colorized_echo yellow "  current: revision=$cur_rev  users=$cur_users"
+        read -p "Proceed? (y/n) " -r reply
+        if [[ ! $reply =~ ^[Yy]$ ]]; then
+            colorized_echo red "Aborted."
+            exit 1
+        fi
+    fi
+
+    # 4. Stop, back up current, install new
+    colorized_echo blue "Stopping Marzban"
+    $COMPOSE -f $COMPOSE_FILE -p "$APP_NAME" down >/dev/null 2>&1 || true
+
+    mkdir -p /var/lib/marzban
+    local stamp backup_path
+    stamp=$(date +%Y%m%d_%H%M%S)
+    if [ -f "$target" ]; then
+        backup_path="$target.pre-import.$stamp"
+        colorized_echo blue "Backing up current DB to: $backup_path"
+        cp "$target" "$backup_path"
+    fi
+
+    colorized_echo blue "Installing imported DB at $target"
+    cp "$src_path" "$target"
+    # Stale WAL/SHM from a previous DB would corrupt readers; remove them.
+    rm -f "${target}-wal" "${target}-shm"
+    chmod 644 "$target"
+
+    # 5. Start — alembic upgrade head runs in the container CMD before uvicorn
+    colorized_echo blue "Starting Marzban (alembic upgrade head runs on start)"
+    $COMPOSE -f $COMPOSE_FILE -p "$APP_NAME" up -d --remove-orphans >/dev/null
+
+    # Give the container a moment to apply migrations
+    sleep 5
+
+    # 6. Verify
+    local final_rev
+    final_rev=$(sqlite3 "$target" "SELECT version_num FROM alembic_version;" 2>/dev/null || echo "?")
+    colorized_echo green "Import complete. DB is now at revision: $final_rev"
+
+    echo
+    colorized_echo cyan "Recent migration log lines:"
+    $COMPOSE -f $COMPOSE_FILE -p "$APP_NAME" logs --tail 50 marzban 2>&1 \
+        | grep -E "Running upgrade|Application startup|ERROR|sqlite3.DatabaseError" \
+        | tail -20 || true
+
+    if [ -n "$backup_path" ]; then
+        echo
+        colorized_echo cyan "Previous DB preserved at: $backup_path"
+        colorized_echo cyan "Remove it manually once you've verified the panel works correctly."
+    fi
+}
+
 check_editor() {
     if [ -z "$EDITOR" ]; then
         if command -v nano >/dev/null 2>&1; then
@@ -1536,6 +1662,7 @@ usage() {
     colorized_echo yellow "  status          $(tput sgr0)– Show status"
     colorized_echo yellow "  logs            $(tput sgr0)– Show logs"
     colorized_echo yellow "  cli             $(tput sgr0)– Marzban CLI"
+    colorized_echo yellow "  cli import <p>  $(tput sgr0)– Import a SQLite DB file (integrity check + alembic upgrade)"
     colorized_echo yellow "  install         $(tput sgr0)– Install Marzban"
     colorized_echo yellow "  update          $(tput sgr0)– Update to latest version"
     colorized_echo yellow "  uninstall       $(tput sgr0)– Uninstall Marzban"
@@ -1568,7 +1695,15 @@ case "$1" in
     logs)
         shift; logs_command "$@";;
     cli)
-        shift; cli_command "$@";;
+        shift
+        # Intercept 'marzban cli import <host-path>' so the host filesystem
+        # path resolves before being passed into the container.
+        if [ "$1" = "import" ]; then
+            shift; import_command "$@"
+        else
+            cli_command "$@"
+        fi
+        ;;
     backup)
         shift; backup_command "$@";;
     backup-service)
